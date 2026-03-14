@@ -20,10 +20,11 @@ of the returned model.
 """
 
 from pathlib import Path
-from huggingface_hub import hf_hub_download
 import typing as tp
 import os
+import tempfile
 
+from huggingface_hub import hf_hub_download
 from omegaconf import OmegaConf, DictConfig
 import torch
 
@@ -35,6 +36,44 @@ from .encodec import CompressionModel
 
 def get_audiocraft_cache_dir() -> tp.Optional[str]:
     return os.environ.get('AUDIOCRAFT_CACHE_DIR', None)
+
+
+def _hf_hub_download_kwargs() -> dict:
+    """Build kwargs for hf_hub_download, including HF_ENDPOINT when set (e.g. for mirror)."""
+    kwargs = {
+        "library_name": "audiocraft",
+        "library_version": audiocraft.__version__,
+    }
+    endpoint = os.environ.get("HF_ENDPOINT")
+    if endpoint:
+        kwargs["endpoint"] = endpoint
+    return kwargs
+
+
+def _download_from_mirror(repo_id: str, filename: str, endpoint: str) -> str:
+    """Download a single file from HF mirror via direct URL; returns path to local file."""
+    base = endpoint.rstrip("/")
+    url = f"{base}/{repo_id}/resolve/main/{filename}"
+    try:
+        import urllib.request
+        req = urllib.request.Request(url, headers={"User-Agent": "audiocraft/1.0"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = resp.read()
+    except Exception as e:
+        raise RuntimeError(f"Failed to download {url}: {e}") from e
+    fd, path = tempfile.mkstemp(suffix=Path(filename).suffix or ".bin")
+    try:
+        os.write(fd, data)
+        os.close(fd)
+        return path
+    except Exception:
+        os.close(fd)
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        raise
 
 
 def _get_state_dict(
@@ -61,14 +100,31 @@ def _get_state_dict(
 
     else:
         assert filename is not None, "filename needs to be defined if using HF checkpoints"
-        file = hf_hub_download(
-            repo_id=file_or_url_or_id,
-            filename=filename,
-            cache_dir=cache_dir,
-            library_name="audiocraft",
-            library_version=audiocraft.__version__,
-        )
-        return torch.load(file, map_location=device)
+        repo_id = file_or_url_or_id
+        try:
+            file = hf_hub_download(
+                repo_id=repo_id,
+                filename=filename,
+                cache_dir=cache_dir,
+                **_hf_hub_download_kwargs(),
+            )
+            return torch.load(file, map_location=device)
+        except Exception as e:
+            endpoint = os.environ.get("HF_ENDPOINT")
+            if not endpoint:
+                raise
+            err_msg = str(e).lower()
+            if "huggingface.co" not in err_msg and "cannot find" not in err_msg and "localentrynotfound" not in err_msg and "filemetadata" not in err_msg:
+                raise
+            # Fallback: mirror may not send X-Repo-Commit etc., so download via direct URL
+            tmp_path = _download_from_mirror(repo_id, filename, endpoint)
+            try:
+                return torch.load(tmp_path, map_location=device)
+            finally:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
 
 
 def load_compression_model_ckpt(file_or_url_or_id: tp.Union[Path, str], cache_dir: tp.Optional[str] = None):
@@ -241,14 +297,28 @@ def load_audioseal_models(
             resp = requests.get(f"{file_or_url_or_id}/{filename}.yaml")
             return OmegaConf.create(resp.text)
         else:
-            file = hf_hub_download(
-                repo_id=file_or_url_or_id,
-                filename=f"{filename}.yaml",
-                cache_dir=cache_dir,
-                library_name="audiocraft",
-                library_version=audiocraft.__version__,
-            )
-            return OmegaConf.load(file)
+            try:
+                file = hf_hub_download(
+                    repo_id=file_or_url_or_id,
+                    filename=f"{filename}.yaml",
+                    cache_dir=cache_dir,
+                    **_hf_hub_download_kwargs(),
+                )
+                return OmegaConf.load(file)
+            except Exception as e:
+                endpoint = os.environ.get("HF_ENDPOINT")
+                if endpoint:
+                    err_msg = str(e).lower()
+                    if "huggingface.co" in err_msg or "cannot find" in err_msg or "localentrynotfound" in err_msg or "filemetadata" in err_msg:
+                        tmp_path = _download_from_mirror(file_or_url_or_id, f"{filename}.yaml", endpoint)
+                        try:
+                            return OmegaConf.load(tmp_path)
+                        finally:
+                            try:
+                                os.remove(tmp_path)
+                            except OSError:
+                                pass
+                raise
 
     try:
         cfg = load_model_config()

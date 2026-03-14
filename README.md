@@ -16,9 +16,18 @@ sudo apt-get install -y libavformat-dev libavcodec-dev libavdevice-dev libavutil
 
 ## 运行GUI
 参考 https://blog.csdn.net/weixin_30951515/article/details/158145206
+
+在 WSL (NAT模式) 中运行:
 ```shell
+pip install "pydantic>=2.0,<2.11"
+pip install modelscope
+#设置HF_ENDPOINT环境变量，比如镜像到魔搭
+python -m demos.musicgen_app --share
 python musicgen_app.py
 ```
+然后在 Windows Chrome 中访问:
+http://127.0.0.1:7860/
+
 
 ## Installation
 AudioCraft requires Python 3.9, PyTorch 2.1.0. To install AudioCraft, you can run the following:
