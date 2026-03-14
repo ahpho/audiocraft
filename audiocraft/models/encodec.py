@@ -117,7 +117,17 @@ class CompressionModel(ABC, nn.Module):
             model = loaders.load_compression_model(name, device=device)
         else:
             logger.info("Getting pretrained compression model from HF %s", name)
-            hf_model = HFEncodecModel.from_pretrained(name)
+            try:
+                hf_model = HFEncodecModel.from_pretrained(name)
+            except (OSError, Exception) as e:
+                import os
+                endpoint = os.environ.get("HF_ENDPOINT")
+                if endpoint and ("Can't load" in str(e) or "huggingface" in str(e).lower() or "couldn't connect" in str(e).lower()):
+                    from .loaders import ensure_hf_model_cached
+                    local_dir = ensure_hf_model_cached(name, endpoint, cache_dir=None)
+                    hf_model = HFEncodecModel.from_pretrained(local_dir)
+                else:
+                    raise
             model = HFEncodecCompressionModel(hf_model).to(device)
         return model.to(device).eval()
 

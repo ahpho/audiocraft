@@ -24,7 +24,7 @@ import typing as tp
 import os
 import tempfile
 
-from huggingface_hub import hf_hub_download
+from huggingface_hub import hf_hub_download, HfApi
 from omegaconf import OmegaConf, DictConfig
 import torch
 
@@ -50,17 +50,70 @@ def _hf_hub_download_kwargs() -> dict:
     return kwargs
 
 
-def _download_from_mirror(repo_id: str, filename: str, endpoint: str) -> str:
-    """Download a single file from HF mirror via direct URL; returns path to local file."""
+def _download_from_mirror(
+    repo_id: str,
+    filename: str,
+    endpoint: str,
+    cache_dir: tp.Optional[str] = None,
+) -> str:
+    """Download a single file from HF mirror via direct URL; returns path to local file.
+    If cache_dir is set (e.g. AUDIOCRAFT_CACHE_DIR), file is saved under cache_dir/mirror/<repo_id>/<filename>
+    and reused on next run; otherwise a temp file is used (caller should delete after use).
+    """
+    import gzip
+    import urllib.request
+
     base = endpoint.rstrip("/")
-    url = f"{base}/{repo_id}/resolve/main/{filename}"
-    try:
-        import urllib.request
-        req = urllib.request.Request(url, headers={"User-Agent": "audiocraft/1.0"})
+
+    def _fetch(url: str) -> bytes:
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "audiocraft/1.0 (https://github.com/facebookresearch/audiocraft)"},
+        )
         with urllib.request.urlopen(req, timeout=60) as resp:
             data = resp.read()
+            ce = resp.headers.get("Content-Encoding", "").strip().lower()
+            if ce == "gzip" or (len(data) >= 2 and data[:2] == b"\x1f\x8b"):
+                data = gzip.decompress(data)
+        return data
+
+    def _valid_json_content(data: bytes) -> bool:
+        if not filename.lower().endswith(".json"):
+            return True
+        try:
+            text = data.decode("utf-8").strip()
+            return bool(text) and (text[0] in "{[")
+        except Exception:
+            return False
+
+    url = f"{base}/{repo_id}/resolve/main/{filename}"
+    try:
+        data = _fetch(url)
     except Exception as e:
         raise RuntimeError(f"Failed to download {url}: {e}") from e
+
+    if not _valid_json_content(data):
+        if data.lstrip()[:1] == b"<":
+            alt_url = f"{base}/{repo_id}/raw/main/{filename}"
+            try:
+                data = _fetch(alt_url)
+            except Exception:
+                pass
+        if not _valid_json_content(data):
+            raise RuntimeError(
+                f"Mirror returned non-JSON for {url} (e.g. HTML error page). "
+                f"Check HF_ENDPOINT={endpoint} or try without mirror."
+            )
+
+    if cache_dir:
+        safe_repo = repo_id.replace("/", "--")
+        cache_path = Path(cache_dir) / "mirror" / safe_repo / filename
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        if cache_path.exists():
+            return str(cache_path)
+        cache_path.write_bytes(data)
+        return str(cache_path)
+
     fd, path = tempfile.mkstemp(suffix=Path(filename).suffix or ".bin")
     try:
         os.write(fd, data)
@@ -74,6 +127,131 @@ def _download_from_mirror(repo_id: str, filename: str, endpoint: str) -> str:
             except OSError:
                 pass
         raise
+
+
+# Fallback file list when HfApi.list_repo_files fails on mirror (e.g. API not available)
+_T5_REPO_FILES_FALLBACK: tp.Dict[str, tp.List[str]] = {
+    "t5-small": [
+        "config.json", "tokenizer_config.json", "tokenizer.json", "special_tokens_map.json",
+        "pytorch_model.bin",
+    ],
+    "t5-base": [
+        "config.json", "tokenizer_config.json", "tokenizer.json", "special_tokens_map.json",
+        "pytorch_model.bin",
+    ],
+    "t5-large": [
+        "config.json", "tokenizer_config.json", "tokenizer.json", "special_tokens_map.json",
+        "pytorch_model.bin",
+    ],
+    "t5-3b": [
+        "config.json", "tokenizer_config.json", "tokenizer.json", "special_tokens_map.json",
+        "pytorch_model.bin",
+    ],
+    "t5-11b": [
+        "config.json", "tokenizer_config.json", "tokenizer.json", "special_tokens_map.json",
+        "pytorch_model.bin",
+    ],
+    "google/flan-t5-small": [
+        "config.json", "tokenizer_config.json", "tokenizer.json", "special_tokens_map.json",
+        "pytorch_model.bin",
+    ],
+    "google/flan-t5-base": [
+        "config.json", "tokenizer_config.json", "tokenizer.json", "special_tokens_map.json",
+        "pytorch_model.bin",
+    ],
+    "google/flan-t5-large": [
+        "config.json", "tokenizer_config.json", "tokenizer.json", "special_tokens_map.json",
+        "pytorch_model.bin",
+    ],
+    "google/flan-t5-xl": [
+        "config.json", "tokenizer_config.json", "tokenizer.json", "special_tokens_map.json",
+        "pytorch_model.bin",
+    ],
+    "google/flan-t5-xxl": [
+        "config.json", "tokenizer_config.json", "tokenizer.json", "special_tokens_map.json",
+        "pytorch_model.bin",
+    ],
+}
+
+# Encodec repo file list (when HfApi.list_repo_files fails on mirror)
+_ENCODEC_REPO_FILES_FALLBACK: tp.Dict[str, tp.List[str]] = {
+    "facebook/encodec_24khz": [
+        "config.json", "preprocessor_config.json", "pytorch_model.bin",
+    ],
+    "facebook/encodec_32khz": [
+        "config.json", "preprocessor_config.json", "pytorch_model.bin", "model.safetensors",
+    ],
+}
+
+# ModelScope (魔搭) model_id mapping: HF repo_id -> modelscope.cn model_id
+# ModelScope is not an HF-compatible mirror; use its SDK when HF_ENDPOINT points to modelscope.cn
+_MODELSCOPE_REPO_MAP: tp.Dict[str, str] = {
+    "t5-small": "AI-ModelScope/t5-small",
+    "t5-base": "AI-ModelScope/t5-base",
+    "t5-large": "AI-ModelScope/t5-large",
+    "t5-3b": "AI-ModelScope/t5-3b",
+    "t5-11b": "AI-ModelScope/t5-11b",
+    "google/flan-t5-small": "AI-ModelScope/flan-t5-small",
+    "google/flan-t5-base": "AI-ModelScope/flan-t5-base",
+    "google/flan-t5-large": "AI-ModelScope/flan-t5-large",
+    "google/flan-t5-xl": "AI-ModelScope/flan-t5-xl",
+    "google/flan-t5-xxl": "AI-ModelScope/flan-t5-xxl",
+}
+
+
+def ensure_hf_model_cached(
+    repo_id: str,
+    endpoint: str,
+    cache_dir: tp.Optional[str] = None,
+) -> str:
+    """Download a full HuggingFace model repo from mirror to a local dir; return path to that dir.
+    Used when transformers.from_pretrained(repo_id) fails (e.g. mirror metadata issue).
+    If HF_ENDPOINT is modelscope.cn (魔搭), uses ModelScope SDK when available.
+    """
+    if cache_dir is None:
+        cache_dir = get_audiocraft_cache_dir()
+    if cache_dir is None:
+        cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "audiocraft")
+    cache_dir = str(cache_dir)
+    safe_repo = repo_id.replace("/", "--")
+    model_dir = Path(cache_dir) / "mirror" / safe_repo
+    if model_dir.exists() and (model_dir / "config.json").exists():
+        return str(model_dir)
+
+    # ModelScope (魔搭): different API and URL; use its SDK instead of HF-style direct URLs
+    if "modelscope.cn" in endpoint:
+        ms_model_id = _MODELSCOPE_REPO_MAP.get(repo_id)
+        if ms_model_id is None:
+            raise RuntimeError(
+                f"ModelScope endpoint detected but no mapping for repo_id={repo_id}. "
+                f"For Hugging Face models use HF_ENDPOINT=https://hf-mirror.com instead."
+            )
+        try:
+            from modelscope.hub.snapshot_download import snapshot_download
+        except ImportError:
+            raise RuntimeError(
+                "HF_ENDPOINT points to ModelScope (modelscope.cn). "
+                "Install ModelScope SDK: pip install modelscope"
+            ) from None
+        model_dir.mkdir(parents=True, exist_ok=True)
+        snapshot_download(ms_model_id, local_dir=str(model_dir), revision="master")
+        return str(model_dir)
+
+    try:
+        api = HfApi(endpoint=endpoint)
+        files = api.list_repo_files(repo_id, revision="main")
+    except Exception:
+        files = _T5_REPO_FILES_FALLBACK.get(repo_id) or _ENCODEC_REPO_FILES_FALLBACK.get(repo_id)
+        if files is None:
+            raise RuntimeError(
+                f"Cannot list files for {repo_id} from mirror and no fallback file list. "
+                "For Hugging Face models (e.g. encodec) use HF_ENDPOINT=https://hf-mirror.com ."
+            ) from None
+
+    for f in files:
+        _download_from_mirror(repo_id, f, endpoint, cache_dir=cache_dir)
+
+    return str(model_dir)
 
 
 def _get_state_dict(
@@ -101,6 +279,15 @@ def _get_state_dict(
     else:
         assert filename is not None, "filename needs to be defined if using HF checkpoints"
         repo_id = file_or_url_or_id
+        # Use a default cache root when unset so mirror fallback always persists
+        effective_cache_dir = cache_dir
+        if effective_cache_dir is None:
+            effective_cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "audiocraft")
+        # Prefer existing mirror cache to avoid re-download and failed hf_hub_download
+        safe_repo = repo_id.replace("/", "--")
+        mirror_path = Path(effective_cache_dir) / "mirror" / safe_repo / filename
+        if mirror_path.exists():
+            return torch.load(str(mirror_path), map_location=device)
         try:
             file = hf_hub_download(
                 repo_id=repo_id,
@@ -116,15 +303,9 @@ def _get_state_dict(
             err_msg = str(e).lower()
             if "huggingface.co" not in err_msg and "cannot find" not in err_msg and "localentrynotfound" not in err_msg and "filemetadata" not in err_msg:
                 raise
-            # Fallback: mirror may not send X-Repo-Commit etc., so download via direct URL
-            tmp_path = _download_from_mirror(repo_id, filename, endpoint)
-            try:
-                return torch.load(tmp_path, map_location=device)
-            finally:
-                try:
-                    os.remove(tmp_path)
-                except OSError:
-                    pass
+            # Fallback: mirror download; always use effective_cache_dir so file is persisted
+            path = _download_from_mirror(repo_id, filename, endpoint, cache_dir=effective_cache_dir)
+            return torch.load(path, map_location=device)
 
 
 def load_compression_model_ckpt(file_or_url_or_id: tp.Union[Path, str], cache_dir: tp.Optional[str] = None):
@@ -310,14 +491,17 @@ def load_audioseal_models(
                 if endpoint:
                     err_msg = str(e).lower()
                     if "huggingface.co" in err_msg or "cannot find" in err_msg or "localentrynotfound" in err_msg or "filemetadata" in err_msg:
-                        tmp_path = _download_from_mirror(file_or_url_or_id, f"{filename}.yaml", endpoint)
+                        path = _download_from_mirror(
+                            file_or_url_or_id, f"{filename}.yaml", endpoint, cache_dir=cache_dir
+                        )
                         try:
-                            return OmegaConf.load(tmp_path)
+                            return OmegaConf.load(path)
                         finally:
-                            try:
-                                os.remove(tmp_path)
-                            except OSError:
-                                pass
+                            if cache_dir is None:
+                                try:
+                                    os.remove(path)
+                                except OSError:
+                                    pass
                 raise
 
     try:

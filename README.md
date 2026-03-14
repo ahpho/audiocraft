@@ -6,7 +6,7 @@
 AudioCraft is a PyTorch library for deep learning research on audio generation. AudioCraft contains inference and training code
 for two state-of-the-art AI generative models producing high-quality audio: AudioGen and MusicGen.
 
-## 安装遇到的问题 0313
+## 安装遇到的问题
 使用conda安装环境，忠实按照Installation操作，遇到报错: pkg-config is required for building PyAV
 
 ```shell
@@ -19,9 +19,12 @@ sudo apt-get install -y libavformat-dev libavcodec-dev libavdevice-dev libavutil
 
 在 WSL (NAT模式) 中运行:
 ```shell
+#使用 conda 新建 env
+#设置 HF_ENDPOINT 环境变量；不使用魔搭，它并不是 HF 的严格镜像
+export HF_ENDPOINT=https://hf-mirror.com
+export AUDIOCRAFT_CACHE_DIR=/mnt/d/Work/AI/models/audiocraft
 pip install "pydantic>=2.0,<2.11"
 pip install modelscope
-#设置HF_ENDPOINT环境变量，比如镜像到魔搭
 python -m demos.musicgen_app --share
 python musicgen_app.py
 ```

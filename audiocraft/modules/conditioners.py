@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from itertools import chain
 import logging
 import math
+import os
 from pathlib import Path
 import random
 import re
@@ -474,6 +475,15 @@ class T5Conditioner(TextConditioner):
             try:
                 self.t5_tokenizer = T5Tokenizer.from_pretrained(name)
                 t5 = T5EncoderModel.from_pretrained(name).train(mode=finetune)
+            except OSError as e:
+                endpoint = os.environ.get("HF_ENDPOINT")
+                if endpoint and ("Can't load" in str(e) or "huggingface.co" in str(e).lower()):
+                    from audiocraft.models.loaders import ensure_hf_model_cached
+                    local_dir = ensure_hf_model_cached(name, endpoint, cache_dir=None)
+                    self.t5_tokenizer = T5Tokenizer.from_pretrained(local_dir)
+                    t5 = T5EncoderModel.from_pretrained(local_dir).train(mode=finetune)
+                else:
+                    raise
             finally:
                 logging.disable(previous_level)
         if finetune:
